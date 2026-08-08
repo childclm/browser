@@ -13,6 +13,7 @@ import skia
 
 # --- 1. 网络请求模块 ---
 COOKIE_JAR = {}
+REQUEST_TIMEOUT_SEC = 10
 
 NAMED_COLORS = {
     "black": "#000000",
@@ -177,7 +178,7 @@ class URL:
             return "about:"
         return self.scheme + "://" + self.host + ":" + str(self.port)
 
-    def request(self, referrer=None, payload=None):
+    def request(self, referrer=None, payload=None, binary=False):
         if self.scheme == "about":
             return {}, ""
         try:
@@ -186,6 +187,7 @@ class URL:
                 type=socket.SOCK_STREAM,
                 proto=socket.IPPROTO_TCP,
             )
+            s.settimeout(REQUEST_TIMEOUT_SEC)
             s.connect((self.host, self.port))
 
             if self.scheme == "https":
@@ -212,9 +214,14 @@ class URL:
                 request += payload
             s.send(request.encode("utf-8"))
 
-            response = s.makefile("r", encoding="utf-8", newline="\r\n")
+            if binary:
+                response = s.makefile("rb")
+            else:
+                response = s.makefile("r", encoding="utf-8", newline="\r\n")
 
             statusline = response.readline()
+            if binary:
+                statusline = statusline.decode("iso-8859-1")
             if not statusline:
                 print(f"DEBUG: Empty response from {self.host}")
                 return {}, ""
@@ -227,6 +234,8 @@ class URL:
                 response_headers = {}
                 while True:
                     line = response.readline()
+                    if binary:
+                        line = line.decode("iso-8859-1")
                     if line == "\r\n":
                         break
                     header, value = line.split(":", 1)
@@ -235,12 +244,14 @@ class URL:
                     location = response_headers["location"]
                     print(f"DEBUG: Following redirect to {location}")
                     new_url = self.resolve(location)
-                    return new_url.request(referrer)
+                    return new_url.request(referrer, binary=binary)
                 return response_headers, ""
 
             response_headers = {}
             while True:
                 line = response.readline()
+                if binary:
+                    line = line.decode("iso-8859-1")
                 if line == "\r\n":
                     break
                 header, value = line.split(":", 1)
@@ -268,6 +279,9 @@ class URL:
         except Exception as e:
             print(f"DEBUG: Request error: {e}")
             return {}, ""
+
+    def request_bytes(self, referrer=None):
+        return self.request(referrer, binary=True)
 
     def resolve(self, url):
         if not url or url.strip() == "":
@@ -320,6 +334,9 @@ class Element:
         self.animations = {}
         self.is_focused = False
         self.layout_objects = []
+        self.image = None
+        self.encoded_data = None
+        self.frame = None
 
     def __repr__(self):
         return "<" + self.tag + ">"
@@ -455,6 +472,12 @@ def tree_to_list(tree, list):
     for child in tree.children:
         tree_to_list(child, list)
     return list
+
+
+def clear_layout_objects(node):
+    node.layout_objects = []
+    for child in node.children:
+        clear_layout_objects(child)
 
 # --- 3. CSS 解析模块 ---
 class CSSParser:
@@ -833,6 +856,7 @@ WIDTH, HEIGHT = 800, 600
 HSTEP, VSTEP = 13, 18
 SCROLL_STEP = 100
 INPUT_WIDTH_PX = 200
+IFRAME_WIDTH_PX, IFRAME_HEIGHT_PX = 300, 150
 
 FONTS = {}
 
@@ -881,8 +905,9 @@ BLOCK_ELEMENTS = [
 HIDDEN_ELEMENTS = ["head", "title", "script", "style"]
 
 class DocumentLayout:
-    def __init__(self, node):
+    def __init__(self, node, frame=None):
         self.node = node
+        self.frame = frame
         self.parent = None
         self.children = []
         self.x = None
@@ -892,11 +917,15 @@ class DocumentLayout:
 
     def layout(self, zoom=1.0):
         self.zoom = zoom
-        self.width = WIDTH - 2 * HSTEP * zoom
+        frame_width = getattr(self.frame, "frame_width", WIDTH)
+        self.width = frame_width - 2 * HSTEP * zoom
         self.x = HSTEP * zoom
         self.y = VSTEP * zoom
-        child = BlockLayout(self.node, self, None)
-        self.children.append(child)
+        if self.children:
+            child = self.children[0]
+        else:
+            child = BlockLayout(self.node, self, None)
+            self.children = [child]
         child.layout(depth=0)
         self.height = child.height if child.height is not None else 0
 
@@ -920,6 +949,7 @@ class BlockLayout:
         self.width = None
         self.height = 0
         self.cursor_x = 0
+        self.children_dirty = True
         node.layout_objects.append(self)
 
     def layout_mode(self):
@@ -930,6 +960,10 @@ class BlockLayout:
             for child in self.node.children
         ]):
             return "block"
+        elif isinstance(self.node, Element) and self.node.tag in [
+            "input", "button", "img", "iframe"
+        ]:
+            return "inline"
         elif self.node.children:
             return "inline"
         else:
@@ -951,20 +985,30 @@ class BlockLayout:
 
         mode = self.layout_mode()
         if mode == "block":
-            previous = None
-            for child in self.node.children:
-                if isinstance(child, Element) and child.tag in HIDDEN_ELEMENTS:
-                    continue
-                next = BlockLayout(child, self, previous)
-                self.children.append(next)
-                previous = next
+            if self.children_dirty:
+                children = []
+                previous = None
+                for child in self.node.children:
+                    if isinstance(child, Element) and child.tag in HIDDEN_ELEMENTS:
+                        continue
+                    clear_layout_objects(child)
+                    next = BlockLayout(child, self, previous)
+                    children.append(next)
+                    previous = next
+                self.children = children
+                self.children_dirty = False
             for child in self.children:
                 child.layout(depth + 1)
             heights = [child.height for child in self.children if child.height is not None]
             self.height = sum(heights) if heights else 0
         else:
-            self.new_line()
-            self.recurse(self.node)
+            if self.children_dirty:
+                for child in self.node.children:
+                    clear_layout_objects(child)
+                self.children = []
+                self.new_line()
+                self.recurse(self.node)
+                self.children_dirty = False
             for child in self.children:
                 child.layout()
             heights = [child.height for child in self.children if child.height is not None]
@@ -979,6 +1023,12 @@ class BlockLayout:
                 return
             if node.tag in ["input", "button"]:
                 self.input(node)
+                return
+            if node.tag == "img" and node.image:
+                self.image(node)
+                return
+            if node.tag == "iframe" and node.frame:
+                self.iframe(node)
                 return
             if node.tag == "br":
                 self.new_line()
@@ -1023,6 +1073,31 @@ class BlockLayout:
         line.children.append(layout)
         self.cursor_x += w + font.measureText(" ")
 
+    def image(self, node):
+        image_width = node.image.width()
+        width = parse_px(node.attributes.get("width"), image_width) * self.zoom
+        self.add_atomic_inline(node, width, ImageLayout)
+
+    def iframe(self, node):
+        width = parse_px(
+            node.attributes.get("width"), IFRAME_WIDTH_PX
+        ) + 2 * self.zoom
+        self.add_atomic_inline(node, width, IframeLayout, self)
+
+    def add_atomic_inline(self, node, width, layout_class, *args):
+        if self.cursor_x + width > self.width:
+            self.new_line()
+        line = self.children[-1]
+        previous = line.children[-1] if line.children else None
+        layout = layout_class(node, line, previous, *args)
+        line.children.append(layout)
+        font = get_font(
+            int(float(node.style["font-size"][:-2]) * .75 * self.zoom),
+            node.style["font-weight"],
+            "roman" if node.style["font-style"] == "normal" else "italic",
+        )
+        self.cursor_x += width + font.measureText(" ")
+
     def self_rect(self):
         return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
 
@@ -1034,6 +1109,23 @@ class BlockLayout:
                 self.node.style.get("border-radius", "0px")
             ) * self.zoom
             cmds.append(DrawRRect(self.self_rect(), radius, bgcolor))
+        if self.node.is_focused and "contenteditable" in self.node.attributes:
+            text_layouts = [
+                obj for obj in tree_to_list(self, [])
+                if isinstance(obj, TextLayout)
+            ]
+            if text_layouts:
+                last = text_layouts[-1]
+                cmds.append(DrawLine(
+                    last.x + last.width, last.y,
+                    last.x + last.width, last.y + last.height,
+                    "red", 1,
+                ))
+            else:
+                cmds.append(DrawLine(
+                    self.x, self.y, self.x, self.y + self.height,
+                    "red", 1,
+                ))
         return cmds
 
     def should_paint(self):
@@ -1071,12 +1163,15 @@ class LineLayout:
             self.height = 0
             return
 
-        max_ascent = max([-word.font.getMetrics().fAscent for word in self.children])
-        baseline = self.y + 1.25 * max_ascent
+        max_ascent = max([-word.ascent for word in self.children])
+        baseline = self.y + max_ascent
         for word in self.children:
-            word.y = baseline + word.font.getMetrics().fAscent
-        max_descent = max([word.font.getMetrics().fDescent for word in self.children])
-        self.height = 1.25 * (max_ascent + max_descent)
+            if isinstance(word, TextLayout):
+                word.y = baseline + word.ascent / 1.25
+            else:
+                word.y = baseline + word.ascent
+        max_descent = max([word.descent for word in self.children])
+        self.height = max_ascent + max_descent
 
     def paint(self):
         return []
@@ -1124,6 +1219,8 @@ class TextLayout:
         )
         self.font = get_font(size, weight, style)
         self.width = self.font.measureText(self.word)
+        self.ascent = self.font.getMetrics().fAscent * 1.25
+        self.descent = self.font.getMetrics().fDescent * 1.25
 
         if self.previous:
             space = self.previous.font.measureText(" ")
@@ -1158,8 +1255,8 @@ def input_text(node):
         return ""
     return ""
 
-class InputLayout:
-    def __init__(self, node, parent, previous):
+class EmbedLayout:
+    def __init__(self, node, parent, previous, frame=None):
         self.node = node
         self.children = []
         self.parent = parent
@@ -1169,6 +1266,9 @@ class InputLayout:
         self.width = None
         self.height = 0
         self.font = None
+        self.ascent = 0
+        self.descent = 0
+        self.frame = frame
         node.layout_objects.append(self)
 
     def layout(self):
@@ -1193,10 +1293,36 @@ class InputLayout:
         else:
             self.x = self.parent.x
 
-        self.height = linespace(self.font)
-
     def self_rect(self):
         return Rect(self.x, self.y, self.x + self.width, self.y + self.height)
+
+    def should_paint(self):
+        return True
+
+    def paint_effects(self, cmds):
+        cmds = paint_visual_effects(self.node, cmds, self.self_rect())
+        paint_outline(self.node, cmds, self.self_rect(), self.zoom)
+        return cmds
+
+
+class InputLayout(EmbedLayout):
+    def __init__(self, node, parent, previous):
+        super().__init__(node, parent, previous)
+
+    def layout(self):
+        super().layout()
+        if self.node.tag == "button":
+            self.width = (
+                self.font.measureText(input_text(self.node))
+                + 2 * HSTEP * self.zoom
+            )
+        else:
+            self.width = INPUT_WIDTH_PX * self.zoom
+        self.height = linespace(self.font)
+        self.ascent = -self.height
+        self.descent = 0
+
+        self.height = linespace(self.font)
 
     def paint(self):
         cmds = []
@@ -1220,13 +1346,95 @@ class InputLayout:
             ))
         return cmds
 
-    def should_paint(self):
-        return True
+class ImageLayout(EmbedLayout):
+    def __init__(self, node, parent, previous):
+        super().__init__(node, parent, previous)
+
+    def layout(self):
+        super().layout()
+        image_width = self.node.image.width()
+        image_height = self.node.image.height()
+        width_attr = self.node.attributes.get("width")
+        height_attr = self.node.attributes.get("height")
+        aspect_ratio = image_width / max(1, image_height)
+        if width_attr and height_attr:
+            self.width = parse_px(width_attr) * self.zoom
+            self.img_height = parse_px(height_attr) * self.zoom
+        elif width_attr:
+            self.width = parse_px(width_attr) * self.zoom
+            self.img_height = self.width / aspect_ratio
+        elif height_attr:
+            self.img_height = parse_px(height_attr) * self.zoom
+            self.width = self.img_height * aspect_ratio
+        else:
+            self.width = image_width * self.zoom
+            self.img_height = image_height * self.zoom
+        self.height = max(self.img_height, linespace(self.font))
+        self.ascent = -self.height
+        self.descent = 0
+
+    def paint(self):
+        rect = Rect(
+            self.x,
+            self.y + self.height - self.img_height,
+            self.x + self.width,
+            self.y + self.height,
+        )
+        quality = self.node.style.get("image-rendering", "auto")
+        if self.node.image:
+            return [DrawImage(self.node.image, rect, quality)]
+        return [DrawBrokenImage(rect)]
+
+
+class IframeLayout(EmbedLayout):
+    def __init__(self, node, parent, previous, parent_frame):
+        super().__init__(node, parent, previous, parent_frame)
+
+    def layout(self):
+        super().layout()
+        width = parse_px(
+            self.node.attributes.get("width"), IFRAME_WIDTH_PX
+        )
+        height = parse_px(
+            self.node.attributes.get("height"), IFRAME_HEIGHT_PX
+        )
+        self.width = (width + 2) * self.zoom
+        self.height = (height + 2) * self.zoom
+        self.ascent = -self.height
+        self.descent = 0
+        if self.node.frame:
+            self.node.frame.frame_width = width * self.zoom
+            self.node.frame.frame_height = height * self.zoom
+
+    def paint(self):
+        return []
 
     def paint_effects(self, cmds):
-        cmds = paint_visual_effects(self.node, cmds, self.self_rect())
-        paint_outline(self.node, cmds, self.self_rect(), self.zoom)
-        return cmds
+        border = 1 * self.zoom
+        inner = skia.Rect.MakeLTRB(
+            self.x + border,
+            self.y + border,
+            self.x + self.width - border,
+            self.y + self.height - border,
+        )
+        if self.node.frame and self.node.frame.loaded:
+            offset = (
+                self.x + border - HSTEP * self.zoom,
+                self.y + border - VSTEP * self.zoom
+                - self.node.frame.scroll,
+            )
+            cmds = [Clip(inner, [
+                Transform(offset, self.self_rect(), cmds)
+            ])]
+        else:
+            cmds = [DrawRect(
+                Rect(self.x, self.y, self.x + self.width, self.y + self.height),
+                "#eeeeee",
+            )]
+        cmds.append(DrawOutline(
+            self.self_rect(), "black", border
+        ))
+        return paint_visual_effects(self.node, cmds, self.self_rect())
 
 
 def get_tabindex(node):
@@ -1244,7 +1452,9 @@ def is_focusable(node):
         return False
     if "tabindex" in node.attributes:
         return True
-    return node.tag in ["input", "button", "a"]
+    return node.tag in ["input", "button", "a"] or (
+        "contenteditable" in node.attributes
+    )
 
 
 def parse_outline(outline):
@@ -1288,6 +1498,69 @@ class DrawText:
             self.text, float(self.rect.left()),
             baseline, self.font, paint
         )
+
+def parse_image_rendering(quality):
+    if quality == "crisp-edges":
+        return skia.SamplingOptions(
+            skia.FilterMode.kNearest, skia.MipmapMode.kNone
+        )
+    if quality == "high-quality":
+        return skia.SamplingOptions(skia.CubicResampler.Mitchell())
+    return skia.SamplingOptions(
+        skia.FilterMode.kLinear, skia.MipmapMode.kLinear
+    )
+
+
+class DrawImage:
+    def __init__(self, image, rect, quality="auto"):
+        self.image = image
+        self.rect = rect
+        self.quality = parse_image_rendering(quality)
+
+    def execute(self, canvas):
+        if self.image:
+            canvas.drawImageRect(
+                self.image, self.rect.to_skia(), self.quality
+            )
+
+
+class DrawBrokenImage:
+    def __init__(self, rect):
+        self.rect = rect
+
+    def execute(self, canvas):
+        outline = skia.Paint(
+            Color=parse_color("#cc0000"),
+            StrokeWidth=1,
+            Style=skia.Paint.kStroke_Style,
+        )
+        fill = skia.Paint(Color=parse_color("#fff4f4"))
+        canvas.drawRect(self.rect.to_skia(), fill)
+        canvas.drawRect(self.rect.to_skia(), outline)
+        canvas.drawLine(
+            self.rect.left, self.rect.top,
+            self.rect.right, self.rect.bottom,
+            outline,
+        )
+        canvas.drawLine(
+            self.rect.left, self.rect.bottom,
+            self.rect.right, self.rect.top,
+            outline,
+        )
+
+
+class Clip:
+    def __init__(self, rect, children):
+        self.rect = rect
+        self.children = children
+
+    def execute(self, canvas):
+        canvas.save()
+        canvas.clipRect(self.rect)
+        for child in self.children:
+            child.execute(canvas)
+        canvas.restore()
+
 
 class DrawRect:
     def __init__(self, rect, color):
@@ -1425,8 +1698,13 @@ def paint_tree(layout_object, display_list):
     cmds = []
     if layout_object.should_paint():
         cmds = layout_object.paint()
-    for child in layout_object.children:
-        paint_tree(child, cmds)
+    if isinstance(layout_object, IframeLayout):
+        frame = layout_object.node.frame
+        if frame and frame.loaded and frame.document:
+            paint_tree(frame.document, cmds)
+    else:
+        for child in layout_object.children:
+            paint_tree(child, cmds)
     if layout_object.should_paint():
         cmds = layout_object.paint_effects(cmds)
     display_list.extend(cmds)
@@ -1458,6 +1736,10 @@ class AccessibilityNode:
             self.role = "textbox"
         elif node.tag == "button":
             self.role = "button"
+        elif node.tag == "img":
+            self.role = "image"
+        elif node.tag == "iframe":
+            self.role = "iframe"
         elif node.tag == "html":
             self.role = "document"
         elif node.tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
@@ -1514,6 +1796,10 @@ class AccessibilityNode:
             self.text = "Link"
         elif self.role == "heading":
             self.text = "Heading"
+        elif self.role == "image":
+            self.text = "Image: " + self.node.attributes.get("alt", "")
+        elif self.role == "iframe":
+            self.text = "Embedded frame"
         elif self.role == "alert":
             self.text = "Alert"
         elif self.role == "document":
@@ -1529,6 +1815,15 @@ class AccessibilityNode:
         if child.role != "none":
             self.children.append(child)
             child.build()
+            if (
+                isinstance(child_node, Element)
+                and child_node.tag == "iframe"
+                and child_node.frame
+                and child_node.frame.loaded
+            ):
+                embedded = AccessibilityNode(child_node.frame.nodes)
+                child.children.append(embedded)
+                embedded.build()
         else:
             for grandchild_node in child_node.children:
                 self.build_internal(grandchild_node)
@@ -1555,74 +1850,59 @@ def speak_text(text):
 
 
 RUNTIME_JS = """
-var NODES = {};
-function Node(handle) { this.handle = handle; }
+var WINDOWS = {};
+var window = null;
+
+function Window(id) {
+    this._id = id;
+    this.NODES = {};
+    this.LISTENERS = {};
+    this.WINDOW_LISTENERS = {};
+    this.SET_TIMEOUT_REQUESTS = {};
+    this.RAF_LISTENERS = [];
+    this.XHR_REQUESTS = {};
+}
+
+function Node(handle, window_id) {
+    this.handle = handle;
+    this.window_id = window_id;
+}
 function get_node(handle) {
-    if (!NODES[handle]) NODES[handle] = new Node(handle);
-    return NODES[handle];
+    if (!window.NODES[handle]) {
+        window.NODES[handle] = new Node(handle, window._id);
+    }
+    return window.NODES[handle];
 }
 Node.prototype.getAttribute = function(attr) {
-    return call_python("getAttribute", this.handle, attr);
+    return call_python("getAttribute", this.handle, attr, this.window_id);
 }
 Node.prototype.setAttribute = function(attr, value) {
-    call_python("setAttribute", this.handle, attr, value.toString());
+    call_python("setAttribute", this.handle, attr, value.toString(), this.window_id);
 }
 Object.defineProperty(Node.prototype, "style", {
     set: function(s) {
-        call_python("style_set", this.handle, s.toString());
+        call_python("style_set", this.handle, s.toString(), this.window_id);
     }
 });
 Object.defineProperty(Node.prototype, "innerHTML", {
     set: function(s) {
-        call_python("innerHTML_set", this.handle, s.toString());
+        call_python("innerHTML_set", this.handle, s.toString(), this.window_id);
     }
 });
-
-var LISTENERS = {};
 Node.prototype.addEventListener = function(type, listener) {
-    if (!LISTENERS[this.handle]) LISTENERS[this.handle] = {};
-    var dict = LISTENERS[this.handle];
+    if (!window.LISTENERS[this.handle]) window.LISTENERS[this.handle] = {};
+    var dict = window.LISTENERS[this.handle];
     if (!dict[type]) dict[type] = [];
     dict[type].push(listener);
 }
-
-var document = {
-    querySelectorAll: function(selector) {
-        var handles = call_python("querySelectorAll", selector);
-        return handles.map(function(handle) { return get_node(handle); });
-    }
-};
-
-var console = {
-    log: function(x) { call_python("log", x); }
-};
-
-var SET_TIMEOUT_REQUESTS = {};
-var RAF_LISTENERS = [];
-var XHR_REQUESTS = {};
-
-function setTimeout(callback, time_delta) {
-    var handle = Object.keys(SET_TIMEOUT_REQUESTS).length;
-    SET_TIMEOUT_REQUESTS[handle] = callback;
-    call_python("setTimeout", handle, time_delta);
-}
-
-function __runSetTimeout(handle) {
-    var callback = SET_TIMEOUT_REQUESTS[handle];
-    callback();
-}
-
-function requestAnimationFrame(fn) {
-    RAF_LISTENERS.push(fn);
-    call_python("requestAnimationFrame");
-}
-
-function __runRAFHandlers() {
-    var handlers_copy = RAF_LISTENERS;
-    RAF_LISTENERS = [];
-    for (var i = 0; i < handlers_copy.length; i++) {
-        handlers_copy[i]();
-    }
+Node.prototype.dispatchEvent = function(evt) {
+    if (typeof evt == "string") evt = new Event(evt);
+    var list = (window.LISTENERS[this.handle] &&
+        window.LISTENERS[this.handle][evt.type]) || [];
+    evt.target = this;
+    evt.currentTarget = this;
+    for (var i = 0; i < list.length; i++) list[i].call(this, evt);
+    return evt.do_default;
 }
 
 function Event(type) {
@@ -1634,55 +1914,129 @@ Event.prototype.preventDefault = function() {
     this.do_default = false;
     this.defaultPrevented = true;
 }
-
-Node.prototype.dispatchEvent = function(evt) {
-    if (typeof evt == "string") evt = new Event(evt);
-    var type = evt.type;
-    var handle = this.handle;
-    var list = (LISTENERS[handle] && LISTENERS[handle][type]) || [];
-    evt.target = this;
-    evt.currentTarget = this;
-    for (var i = 0; i < list.length; i++) {
-        list[i].call(this, evt);
-    }
-    return evt.do_default;
+function MessageEvent(data, source, origin) {
+    this.type = "message";
+    this.data = data;
+    this.source = source;
+    this.origin = origin;
 }
 
-function dispatch_event(type, handle) {
+function dispatch_event(type, handle, window_id) {
+    window = WINDOWS[window_id];
     return get_node(handle).dispatchEvent(new Event(type));
 }
 
-function XMLHttpRequest() {
-    this.handle = Object.keys(XHR_REQUESTS).length;
-    XHR_REQUESTS[this.handle] = this;
+function setTimeout(callback, time_delta) {
+    var handle = Object.keys(window.SET_TIMEOUT_REQUESTS).length;
+    window.SET_TIMEOUT_REQUESTS[handle] = callback;
+    call_python("setTimeout", handle, time_delta, window._id);
+}
+function __runSetTimeout(handle, window_id) {
+    if (window_id === undefined) window_id = 0;
+    window = WINDOWS[window_id];
+    var callback = window.SET_TIMEOUT_REQUESTS[handle];
+    callback();
 }
 
+function requestAnimationFrame(fn) {
+    window.RAF_LISTENERS.push(fn);
+    call_python("requestAnimationFrame", window._id);
+}
+function __runRAFHandlers(window_id) {
+    if (window_id === undefined) window_id = 0;
+    window = WINDOWS[window_id];
+    var handlers_copy = window.RAF_LISTENERS;
+    window.RAF_LISTENERS = [];
+    for (var i = 0; i < handlers_copy.length; i++) handlers_copy[i]();
+}
+
+function XMLHttpRequest() {
+    this.handle = Object.keys(window.XHR_REQUESTS).length;
+    window.XHR_REQUESTS[this.handle] = this;
+}
 XMLHttpRequest.prototype.open = function(method, url, is_async) {
     this.is_async = is_async;
     this.method = method;
     this.url = url;
 }
-
 XMLHttpRequest.prototype.send = function(body) {
     this.responseText = call_python(
-        "XMLHttpRequest_send",
-        this.method, this.url, body || "",
-        this.is_async, this.handle);
+        "XMLHttpRequest_send", this.method, this.url, body || "",
+        this.is_async, this.handle, window._id);
+}
+function __runXHROnload(body, handle, window_id) {
+    if (window_id === undefined) window_id = 0;
+    window = WINDOWS[window_id];
+    var obj = window.XHR_REQUESTS[handle];
+    obj.responseText = body;
+    if (obj.onload) obj.onload(new Event("load"));
 }
 
-function __runXHROnload(body, handle) {
-    var obj = XHR_REQUESTS[handle];
-    obj.responseText = body;
-    if (obj.onload) {
-        obj.onload(new Event("load"));
+function __runPostMessage(data, source_id, origin, target_id) {
+    if (target_id === undefined) target_id = 0;
+    window = WINDOWS[target_id];
+    var source = WINDOWS[source_id];
+    if (source === undefined && source_id !== undefined && source_id >= 0) {
+        source = { _id: source_id };
+        source.postMessage = function(message, target_origin) {
+            call_python("postMessage", window._id, source._id,
+                message, target_origin || "*");
+        }
     }
+    if (source === undefined) source = null;
+    window.dispatchEvent(new MessageEvent(data, source, origin));
+}
+
+function setup_window(w) {
+    w.addEventListener = function(type, listener) {
+        if (!w.WINDOW_LISTENERS[type]) w.WINDOW_LISTENERS[type] = [];
+        w.WINDOW_LISTENERS[type].push(listener);
+    }
+    w.dispatchEvent = function(evt) {
+        var list = w.WINDOW_LISTENERS[evt.type] || [];
+        for (var i = 0; i < list.length; i++) list[i].call(w, evt);
+    }
+    w.postMessage = function(message, origin) {
+        call_python("postMessage", window._id, w._id, message, origin || "*");
+    }
+    Object.defineProperty(w, "parent", {
+        get: function() {
+            var parent_id = call_python("parent", w._id);
+            if (parent_id == null) return w;
+            var parent = WINDOWS[parent_id];
+            if (parent !== undefined) return parent;
+            parent = { _id: parent_id };
+            parent.postMessage = function(message, origin) {
+                call_python("postMessage", window._id, parent._id,
+                    message, origin || "*");
+            }
+            return parent;
+        }
+    });
+    w.document = {
+        querySelectorAll: function(selector) {
+            var handles = call_python("querySelectorAll", selector, w._id);
+            return handles.map(function(handle) {
+                window = w;
+                return get_node(handle);
+            });
+        }
+    };
+    w.console = { log: function(x) { call_python("log", x); } };
+    w.setTimeout = setTimeout;
+    w.requestAnimationFrame = requestAnimationFrame;
+    w.XMLHttpRequest = XMLHttpRequest;
+    w.Node = Node;
+    w.Event = Event;
 }
 0;
 """
 
 class JSContext:
-    def __init__(self, tab):
+    def __init__(self, tab, url_origin=None):
         self.tab = tab
+        self.root = getattr(tab, "root", tab)
+        self.url_origin = url_origin
         self.discarded = False
         self.interp = dukpy.JSInterpreter()
         self.node_to_handle = {}
@@ -1696,58 +2050,123 @@ class JSContext:
         self.interp.export_function("setTimeout", self.setTimeout)
         self.interp.export_function("requestAnimationFrame", self.requestAnimationFrame)
         self.interp.export_function("XMLHttpRequest_send", self.XMLHttpRequest_send)
+        self.interp.export_function("parent", self.parent)
+        self.interp.export_function("postMessage", self.postMessage)
         self.interp.evaljs(RUNTIME_JS)
+        window_id = getattr(self.tab, "window_id", 0)
+        self.add_window(self.tab, window_id)
 
-    def run(self, script, code):
+    def add_window(self, frame, window_id=None):
+        if window_id is None:
+            window_id = getattr(frame, "window_id", 0)
+        self.interp.evaljs(
+            "WINDOWS[dukpy.window_id] = new Window(dukpy.window_id);"
+            "setup_window(WINDOWS[dukpy.window_id]);",
+            window_id=window_id,
+        )
+
+    def wrap(self, code, window_id):
+        return (
+            "window = WINDOWS[{}]; "
+            "document = window.document; "
+            "console = window.console; "
+            "setTimeout = window.setTimeout; "
+            "requestAnimationFrame = window.requestAnimationFrame; "
+            "XMLHttpRequest = window.XMLHttpRequest; "
+            "Node = window.Node; Event = window.Event; "
+            "{}"
+        ).format(window_id, code)
+
+    def frame_for_window(self, window_id):
+        frames = getattr(self.root, "window_id_to_frame", {})
+        return frames.get(window_id, self.tab)
+
+    def throw_if_cross_origin(self, window_id):
+        frame = self.frame_for_window(window_id)
+        if not self.url_origin or not getattr(frame, "url", None):
+            return
+        if frame.url.origin() != self.url_origin:
+            raise Exception("Cross-origin access disallowed from script")
+
+    def run(self, script, code, window_id=None):
+        if window_id is None:
+            window_id = getattr(self.tab, "window_id", 0)
         try:
-            return self.interp.evaljs(code)
+            return self.interp.evaljs(self.wrap(code, window_id))
         except dukpy.JSRuntimeError as e:
             print(f"Script {script} crashed", e)
 
-    def dispatch_event(self, type, elt):
-        handle = self.get_handle(elt)
+    def dispatch_event(self, type, elt, window_id=None):
+        if window_id is None:
+            window_id = getattr(self.tab, "window_id", 0)
+        handle = self.get_handle(elt, window_id)
         try:
-            do_default = self.interp.evaljs(f"dispatch_event({type!r}, {handle})")
+            code = self.wrap(
+                f"dispatch_event({type!r}, {handle}, {window_id})",
+                window_id,
+            )
+            do_default = self.interp.evaljs(code)
             return not do_default
         except dukpy.JSRuntimeError as e:
             print("Script event crashed", e)
             return False
 
-    def get_handle(self, elt):
-        if elt not in self.node_to_handle:
-            handle = len(self.node_to_handle)
-            self.node_to_handle[elt] = handle
-            self.handle_to_node[handle] = elt
-        return self.node_to_handle[elt]
+    def get_handle(self, elt, window_id=0):
+        key = (window_id, elt)
+        if key not in self.node_to_handle:
+            handle = sum(
+                1 for owner, _ in self.node_to_handle if owner == window_id
+            )
+            self.node_to_handle[key] = handle
+            self.handle_to_node[(window_id, handle)] = elt
+        return self.node_to_handle[key]
 
-    def querySelectorAll(self, selector_text):
+    def querySelectorAll(self, selector_text, window_id=0):
+        self.throw_if_cross_origin(window_id)
+        frame = self.frame_for_window(window_id)
         selector = CSSParser(selector_text).selector()
         return [
-            self.get_handle(node)
-            for node in tree_to_list(self.tab.nodes, [])
+            self.get_handle(node, window_id)
+            for node in tree_to_list(frame.nodes, [])
             if selector.matches(node)
         ]
 
-    def getAttribute(self, handle, attr):
-        elt = self.handle_to_node[handle]
+    def parent(self, window_id):
+        frame = self.frame_for_window(window_id)
+        if not getattr(frame, "parent_frame", None):
+            return None
+        return frame.parent_frame.window_id
+
+    def getAttribute(self, handle, attr, window_id=0):
+        self.throw_if_cross_origin(window_id)
+        elt = self.handle_to_node[(window_id, handle)]
         return elt.attributes.get(attr, "")
 
-    def setAttribute(self, handle, attr, value):
-        elt = self.handle_to_node[handle]
+    def setAttribute(self, handle, attr, value, window_id=0):
+        self.throw_if_cross_origin(window_id)
+        elt = self.handle_to_node[(window_id, handle)]
         elt.attributes[attr] = value
-        if hasattr(self.tab, "set_needs_render"):
-            self.tab.set_needs_render()
+        frame = self.frame_for_window(window_id)
+        if hasattr(frame, "invalidate_layout_from"):
+            frame.invalidate_layout_from(elt)
+        if hasattr(frame, "set_needs_render"):
+            frame.set_needs_render()
 
-    def style_set(self, handle, value):
-        elt = self.handle_to_node[handle]
+    def style_set(self, handle, value, window_id=0):
+        self.throw_if_cross_origin(window_id)
+        elt = self.handle_to_node[(window_id, handle)]
         elt.attributes["style"] = value
-        if hasattr(self.tab, "set_needs_render"):
-            self.tab.set_needs_render()
+        frame = self.frame_for_window(window_id)
+        if hasattr(frame, "invalidate_layout_from"):
+            frame.invalidate_layout_from(elt)
+        if hasattr(frame, "set_needs_render"):
+            frame.set_needs_render()
         else:
-            self.tab.render()
+            frame.render()
 
-    def innerHTML_set(self, handle, s):
-        elt = self.handle_to_node[handle]
+    def innerHTML_set(self, handle, s, window_id=0):
+        self.throw_if_cross_origin(window_id)
+        elt = self.handle_to_node[(window_id, handle)]
         doc = HTMLParser("<html><body>" + s + "</body></html>").parse()
         body = next(
             node for node in tree_to_list(doc, [])
@@ -1755,58 +2174,78 @@ class JSContext:
         )
         elt.children = body.children
         self.fix_parent_pointers(elt)
-        if hasattr(self.tab, "set_needs_render"):
-            self.tab.set_needs_render()
+        frame = self.frame_for_window(window_id)
+        if hasattr(frame, "invalidate_layout_from"):
+            frame.invalidate_layout_from(elt)
+        if hasattr(frame, "set_needs_render"):
+            frame.set_needs_render()
         else:
-            self.tab.render()
+            frame.render()
 
-    def dispatch_settimeout(self, handle):
+    def dispatch_settimeout(self, handle, window_id):
         if self.discarded:
             return
         try:
-            self.interp.evaljs("__runSetTimeout(dukpy.handle)", handle=handle)
+            self.interp.evaljs(
+                self.wrap("__runSetTimeout(dukpy.handle, dukpy.window_id)",
+                          window_id),
+                handle=handle,
+                window_id=window_id,
+            )
         except dukpy.JSRuntimeError as e:
             print("setTimeout callback crashed", e)
 
-    def setTimeout(self, handle, time_delta):
+    def setTimeout(self, handle, time_delta, window_id=0):
         def run_callback():
-            task = Task(self.dispatch_settimeout, handle)
-            self.tab.task_runner.schedule_task(task)
+            task = Task(self.dispatch_settimeout, handle, window_id)
+            self.root.task_runner.schedule_task(task)
 
         timer = threading.Timer(float(time_delta) / 1000.0, run_callback)
         timer.daemon = True
         timer.start()
 
-    def dispatch_xhr_onload(self, out, handle):
+    def dispatch_xhr_onload(self, out, handle, window_id):
         if self.discarded:
             return
         try:
             self.interp.evaljs(
-                "__runXHROnload(dukpy.out, dukpy.handle)",
+                self.wrap(
+                    "__runXHROnload(dukpy.out, dukpy.handle, dukpy.window_id)",
+                    window_id,
+                ),
                 out=out,
                 handle=handle,
+                window_id=window_id,
             )
         except dukpy.JSRuntimeError as e:
             print("XHR onload crashed", e)
 
-    def requestAnimationFrame(self):
-        browser = getattr(self.tab, "browser", None)
+    def requestAnimationFrame(self, window_id=0):
+        frame = self.frame_for_window(window_id)
+        browser = getattr(frame, "browser", None)
         if browser:
-            browser.request_animation_frame(self.tab)
+            browser.request_animation_frame(frame)
 
-    def XMLHttpRequest_send(self, method, url, body, is_async, handle):
-        full_url = self.tab.url.resolve(url)
-        if not self.tab.allowed_request(full_url):
+    def XMLHttpRequest_send(
+        self, method, url, body, is_async, handle, window_id=0
+    ):
+        frame = self.frame_for_window(window_id)
+        full_url = frame.url.resolve(url)
+        if not frame.allowed_request(full_url):
             raise Exception("Cross-origin XHR blocked by CSP")
-        if full_url.origin() != self.tab.url.origin():
+        if full_url.origin() != frame.url.origin():
             raise Exception("Cross-origin XHR request not allowed")
 
         def run_load():
             payload = body if method.casefold() == "post" else None
-            _, out = full_url.request(self.tab.url, payload)
+            _, out = full_url.request(frame.url, payload)
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", "replace")
             if is_async:
-                task = Task(self.dispatch_xhr_onload, out, handle)
-                self.tab.task_runner.schedule_task(task)
+                task = Task(
+                    self.dispatch_xhr_onload, out, handle, window_id
+                )
+                self.root.task_runner.schedule_task(task)
             if not is_async:
                 return out
 
@@ -1815,6 +2254,44 @@ class JSContext:
 
         thread = threading.Thread(target=run_load, daemon=True)
         thread.start()
+
+    def postMessage(
+        self, source_window_id, target_window_id, message, origin
+    ):
+        task = Task(
+            self.root.post_message,
+            message,
+            target_window_id,
+            source_window_id,
+            origin,
+        )
+        self.root.task_runner.schedule_task(task)
+
+    def dispatch_post_message(
+        self, message, source_window_id, origin, target_window_id
+    ):
+        if self.discarded:
+            return
+        try:
+            code = self.wrap(
+                "__runPostMessage(dukpy.data, dukpy.source_id, "
+                "dukpy.origin, dukpy.target_id)",
+                target_window_id,
+            )
+            same_context_source = source_window_id
+            if source_window_id not in getattr(
+                self.root, "window_id_to_frame", {}
+            ):
+                same_context_source = -1
+            self.interp.evaljs(
+                code,
+                data=message,
+                source_id=same_context_source,
+                origin=origin,
+                target_id=target_window_id,
+            )
+        except dukpy.JSRuntimeError as e:
+            print("postMessage event crashed", e)
 
     def fix_parent_pointers(self, node):
         for child in node.children:
@@ -2030,6 +2507,7 @@ DEFAULT_STYLE_SHEET = CSSParser("""
     big { font-size: 110%; }
     input { font-size: 16px; font-weight: normal; font-style: normal; background-color: lightblue; }
     button { font-size: 16px; font-weight: normal; font-style: normal; background-color: orange; }
+    iframe { outline: 1px solid black; }
     input:focus { outline: 2px solid black; }
     button:focus { outline: 2px solid black; }
     a:focus { outline: 2px solid black; }
@@ -2046,10 +2524,14 @@ DEFAULT_STYLE_SHEET = CSSParser("""
 """).parse()
 
 class Tab:
-    def __init__(self, tab_height):
+    def __init__(self, tab_height, parent_frame=None, frame_element=None):
         self.tab_height = tab_height
         self.browser = None
+        self.parent_frame = parent_frame
+        self.frame_element = frame_element
+        self.root = self if parent_frame is None else parent_frame.root
         self.url = None
+        self.nodes = None
         self.scroll = 0
         self.scroll_changed_in_tab = False
         self.history = []
@@ -2075,17 +2557,52 @@ class Tab:
         self.next_animation_frame = 0.0
         self.task_runner = TaskRunner(self)
         self.loaded = False
+        self.focused_frame = None
+        self.frame_width = WIDTH
+        self.frame_height = tab_height
+        if parent_frame is None:
+            self.window_id = 0
+            self.window_id_to_frame = {}
+            self.next_window_id = 1
+            self.window_id_to_frame[self.window_id] = self
+        else:
+            self.task_runner = self.root.task_runner
+            self.window_id = self.root.next_window_id
+            self.root.next_window_id += 1
+            self.root.window_id_to_frame[self.window_id] = self
 
     def allowed_request(self, url):
         return self.allowed_origins is None or url.origin() in self.allowed_origins
+
+    def all_frames(self):
+        if self.parent_frame is None:
+            return [
+                frame for frame in self.window_id_to_frame.values()
+                if frame is self or frame.loaded
+            ]
+        return [self]
+
+    def get_js(self, url):
+        root = self.root
+        if not hasattr(root, "origin_to_js"):
+            root.origin_to_js = {}
+        origin = url.origin()
+        if origin not in root.origin_to_js:
+            root.origin_to_js[origin] = JSContext(root, origin)
+        return root.origin_to_js[origin]
 
     def load(self, url, add_history=True, bookmarks=None, payload=None):
         self.loaded = False
         self.focus_element(None)
         self.zoom = 1.0
-        self.task_runner.clear_pending_tasks()
-        if self.js:
-            self.js.discarded = True
+        if self.parent_frame is None:
+            self.task_runner.clear_pending_tasks()
+            if self.js:
+                self.js.discarded = True
+            self.window_id_to_frame = {self.window_id: self}
+            self.next_window_id = 1
+            self.focused_frame = None
+            self.origin_to_js = {}
         referrer = self.url
         if bookmarks is not None:
             self.bookmarks = bookmarks
@@ -2095,9 +2612,13 @@ class Tab:
             else:
                 headers, body = url.request(referrer, payload)
             if len(body) == 0:
+                self.needs_animation_frame = False
                 return
+            if isinstance(body, bytes):
+                body = body.decode("utf-8", "replace")
         except Exception as e:
             print(f"请求失败: {e}")
+            self.needs_animation_frame = False
             return
 
         self.url = url
@@ -2110,11 +2631,46 @@ class Tab:
             if len(csp) > 0 and csp[0] == "default-src":
                 self.allowed_origins = []
                 for origin in csp[1:]:
+                    origin = origin.strip(";,\"'")
+                    if "://" not in origin:
+                        continue
                     self.allowed_origins.append(URL(origin).origin())
 
         self.nodes = HTMLParser(body).parse()
+        self.document = None
         self.accessibility_tree = None
-        self.js = JSContext(self)
+        self.js = self.get_js(url)
+        self.js.add_window(self, self.window_id)
+
+        images = [
+            node for node in tree_to_list(self.nodes, [])
+            if isinstance(node, Element) and node.tag == "img"
+            and "src" in node.attributes
+        ]
+        for img in images:
+            image_url = url.resolve(img.attributes["src"])
+            if not self.allowed_request(image_url):
+                print("Blocked image", image_url, "due to CSP")
+                continue
+            self.start_image_load(img, image_url, url)
+
+        iframes = [
+            node for node in tree_to_list(self.nodes, [])
+            if isinstance(node, Element) and node.tag == "iframe"
+            and "src" in node.attributes
+        ]
+        for iframe in iframes:
+            document_url = url.resolve(iframe.attributes["src"])
+            if not self.allowed_request(document_url):
+                print("Blocked iframe", document_url, "due to CSP")
+                iframe.frame = None
+                continue
+            iframe.frame = Tab(self.tab_height, parent_frame=self, frame_element=iframe)
+            iframe.frame.browser = self.browser
+            iframe.frame.dark_mode = self.dark_mode
+            iframe.frame.task_runner = self.task_runner
+            task = Task(iframe.frame.load, document_url)
+            self.task_runner.schedule_task(task)
 
         scripts = [
             node.attributes["src"]
@@ -2128,11 +2684,7 @@ class Tab:
             if not self.allowed_request(script_url):
                 print("Blocked script", script, "due to CSP")
                 continue
-            try:
-                _, body = script_url.request(url)
-            except:
-                continue
-            self.task_runner.schedule_task(Task(self.js.run, script, body))
+            self.start_script_load(script, script_url, url)
 
         rules = DEFAULT_STYLE_SHEET.copy()
         links = [
@@ -2144,15 +2696,11 @@ class Tab:
             and "href" in node.attributes
         ]
         for link in links:
-            try:
-                style_url = url.resolve(link)
-                if not self.allowed_request(style_url):
-                    print("Blocked style", link, "due to CSP")
-                    continue
-                _, body = style_url.request(url)
-                rules.extend(CSSParser(body).parse())
-            except:
+            style_url = url.resolve(link)
+            if not self.allowed_request(style_url):
+                print("Blocked style", link, "due to CSP")
                 continue
+            self.start_stylesheet_load(style_url, url)
 
         self.rules = rules
         self.scroll = 0
@@ -2166,6 +2714,64 @@ class Tab:
         self.loaded = True
         if self.browser:
             self.browser.set_needs_raster_and_draw()
+
+    def start_image_load(self, img, image_url, referrer_url):
+        def fetch():
+            try:
+                _, body = image_url.request_bytes(referrer_url)
+                if isinstance(body, str):
+                    body = body.encode("utf-8")
+                task = Task(self.finish_image_load, img, body)
+            except Exception as e:
+                print("Image", img.attributes.get("src", ""), "crashed", e)
+                task = Task(self.finish_image_load, img, None)
+            self.root.task_runner.schedule_task(task)
+
+        thread = threading.Thread(target=fetch, daemon=True)
+        thread.start()
+
+    def finish_image_load(self, img, body):
+        if body is None:
+            img.image = None
+            img.encoded_data = None
+        else:
+            img.encoded_data = body
+            data = skia.Data.MakeWithoutCopy(body)
+            img.image = skia.Image.MakeFromEncoded(data)
+        self.set_needs_render()
+
+    def start_script_load(self, script, script_url, referrer_url):
+        def fetch():
+            try:
+                _, body = script_url.request(referrer_url)
+                if isinstance(body, bytes):
+                    body = body.decode("utf-8", "replace")
+                task = Task(self.js.run, script, body, self.window_id)
+            except Exception:
+                return
+            self.root.task_runner.schedule_task(task)
+
+        thread = threading.Thread(target=fetch, daemon=True)
+        thread.start()
+
+    def start_stylesheet_load(self, style_url, referrer_url):
+        def fetch():
+            try:
+                _, body = style_url.request(referrer_url)
+                if isinstance(body, bytes):
+                    body = body.decode("utf-8", "replace")
+                parsed = CSSParser(body).parse()
+                task = Task(self.finish_stylesheet_load, parsed)
+                self.root.task_runner.schedule_task(task)
+            except Exception:
+                return
+
+        thread = threading.Thread(target=fetch, daemon=True)
+        thread.start()
+
+    def finish_stylesheet_load(self, parsed_rules):
+        self.rules.extend(parsed_rules)
+        self.set_needs_render()
 
     def about_page(self, url):
         if url.path != "bookmarks":
@@ -2187,11 +2793,48 @@ class Tab:
         for cmd in self.display_list:
             cmd.execute(canvas)
 
+    def invalidate_layout_from(self, node):
+        current = node
+        marked = False
+        while current:
+            for layout_object in getattr(current, "layout_objects", []):
+                if isinstance(layout_object, BlockLayout):
+                    layout_object.children_dirty = True
+                    marked = True
+            if marked:
+                break
+            current = current.parent
+        self.needs_render = True
+        self.needs_layout = True
+        self.needs_paint = True
+        self.needs_accessibility = True
+        if self.parent_frame:
+            self.root.needs_render = True
+            self.root.needs_paint = True
+            self.root.needs_accessibility = True
+        self.set_needs_animation_frame(immediate=True)
+
+    def set_needs_layout(self):
+        self.needs_render = True
+        self.needs_layout = True
+        self.needs_paint = True
+        self.needs_accessibility = True
+        if self.parent_frame:
+            self.root.needs_render = True
+            self.root.needs_paint = True
+            self.root.needs_accessibility = True
+        self.set_needs_animation_frame(immediate=True)
+
     def set_needs_render(self):
         self.needs_render = True
         self.needs_style = True
         self.needs_layout = True
         self.needs_paint = True
+        self.needs_accessibility = True
+        if self.parent_frame:
+            self.root.needs_render = True
+            self.root.needs_paint = True
+            self.root.needs_accessibility = True
         self.set_needs_animation_frame(immediate=True)
 
     def set_needs_animation_frame(self, immediate=False):
@@ -2200,38 +2843,62 @@ class Tab:
             self.browser.request_animation_frame(self, immediate=immediate)
 
     def run_animation_frame(self):
-        if self.js and not self.js.discarded:
-            try:
-                self.js.interp.evaljs("__runRAFHandlers()")
-            except dukpy.JSRuntimeError as e:
-                print("requestAnimationFrame callback crashed", e)
+        frames = self.all_frames()
+        for frame in frames:
+            if not getattr(frame, "nodes", None):
+                continue
+            if frame.js and not frame.js.discarded:
+                try:
+                    frame.js.interp.evaljs(
+                        frame.js.wrap(
+                            "__runRAFHandlers({})".format(frame.window_id),
+                            frame.window_id,
+                        )
+                    )
+                except dukpy.JSRuntimeError as e:
+                    print("requestAnimationFrame callback crashed", e)
 
         # A script callback can change style or DOM content. Resolve those
         # changes before advancing transitions so a transition starts from
         # the style visible at the beginning of this frame.
         self.render()
-        if self.needs_focus_scroll and self.focus:
-            self.scroll_to(self.focus)
-        self.needs_focus_scroll = False
+        for frame in frames:
+            if not getattr(frame, "nodes", None):
+                continue
+            if frame.needs_focus_scroll and frame.focus:
+                frame.scroll_to(frame.focus)
+            frame.needs_focus_scroll = False
 
         active_animations = False
-        for node in tree_to_list(self.nodes, []):
-            for property_name, animation in list(node.animations.items()):
-                node.style[property_name] = animation.animate()
-                self.needs_paint = True
-                if animation.done:
-                    del node.animations[property_name]
-                else:
-                    active_animations = True
+        for frame in frames:
+            if not getattr(frame, "nodes", None):
+                continue
+            for node in tree_to_list(frame.nodes, []):
+                for property_name, animation in list(node.animations.items()):
+                    node.style[property_name] = animation.animate()
+                    frame.needs_paint = True
+                    frame.needs_render = True
+                    if frame.parent_frame:
+                        frame.root.needs_paint = True
+                        frame.root.needs_render = True
+                    if animation.done:
+                        del node.animations[property_name]
+                    else:
+                        active_animations = True
 
         if active_animations:
             self.set_needs_animation_frame()
         self.render()
-        self.scroll_changed_in_tab = False
+        for frame in frames:
+            frame.scroll_changed_in_tab = False
         if self.browser:
             self.browser.set_needs_raster_and_draw()
 
     def scrolldown(self):
+        frame = self.focused_frame or self
+        if frame is not self:
+            frame.scrolldown()
+            return
         if not self.document:
             return
         new_scroll = self.clamp_scroll(self.scroll + SCROLL_STEP)
@@ -2245,7 +2912,7 @@ class Tab:
         if not self.document:
             return max(0, scroll)
         document_height = self.document.height + 2 * VSTEP * self.zoom
-        max_scroll = max(0, document_height - self.tab_height)
+        max_scroll = max(0, document_height - self.frame_height)
         return max(0, min(scroll, max_scroll))
 
     def scroll_to(self, elt):
@@ -2268,7 +2935,7 @@ class Tab:
         top = min(rect.top() for rect in bounds)
         bottom = max(rect.bottom() for rect in bounds)
         viewport_top = self.scroll
-        viewport_bottom = self.scroll + self.tab_height
+        viewport_bottom = self.scroll + self.frame_height
         if top >= viewport_top and bottom <= viewport_bottom:
             return
 
@@ -2281,11 +2948,22 @@ class Tab:
         if not elt:
             self.focus_element(None)
             return
+        if isinstance(elt, Element) and elt.tag == "iframe" and elt.frame:
+            layout = elt.layout_objects[0]
+            border = 1 * layout.zoom
+            elt.frame.click(
+                x - layout.x - border,
+                y - layout.y - border + elt.frame.scroll,
+            )
+            self.root.focused_frame = elt.frame
+            return
         while elt:
             if isinstance(elt, Text):
                 pass
             elif is_focusable(elt):
-                if self.js and self.js.dispatch_event("click", elt):
+                if self.js and self.js.dispatch_event(
+                    "click", elt, self.window_id
+                ):
                     return
                 self.focus_element(elt)
                 if elt.tag == "a" and "href" in elt.attributes:
@@ -2293,6 +2971,8 @@ class Tab:
                     self.load(url, bookmarks=self.bookmarks)
                 elif elt.tag == "button":
                     self.submit_form(elt)
+                elif self.parent_frame:
+                    self.root.focused_frame = self
                 return
             elt = elt.parent
 
@@ -2332,7 +3012,9 @@ class Tab:
             elt = elt.parent
         if not elt:
             return
-        if self.js and self.js.dispatch_event("submit", elt):
+        if self.js and self.js.dispatch_event(
+            "submit", elt, self.window_id
+        ):
             return
         inputs = [
             node for node in tree_to_list(elt, [])
@@ -2357,25 +3039,72 @@ class Tab:
             self.load(URL(str(url) + (separator + body if body else "")), bookmarks=self.bookmarks)
 
     def keypress(self, char):
+        frame = self.focused_frame or self
+        if frame is not self:
+            frame.keypress(char)
+            return
+        if self.focus and "contenteditable" in self.focus.attributes:
+            if self.js and self.js.dispatch_event(
+                "keydown", self.focus, self.window_id
+            ):
+                return
+            text_nodes = [
+                node for node in tree_to_list(self.focus, [])
+                if isinstance(node, Text)
+            ]
+            if text_nodes:
+                last_text = text_nodes[-1]
+            else:
+                last_text = Text("", self.focus)
+                self.focus.children.append(last_text)
+            last_text.text += char
+            self.invalidate_layout_from(self.focus)
+            self.set_needs_layout()
+            return
         if self.focus and self.focus.tag == "input":
-            if self.js and self.js.dispatch_event("keydown", self.focus):
+            if self.js and self.js.dispatch_event(
+                "keydown", self.focus, self.window_id
+            ):
                 return
             self.focus.attributes["value"] = self.focus.attributes.get("value", "") + char
             self.set_needs_render()
 
     def backspace(self):
+        frame = self.focused_frame or self
+        if frame is not self:
+            frame.backspace()
+            return
+        if self.focus and "contenteditable" in self.focus.attributes:
+            text_nodes = [
+                node for node in tree_to_list(self.focus, [])
+                if isinstance(node, Text)
+            ]
+            if text_nodes:
+                last_text = text_nodes[-1]
+                last_text.text = last_text.text[:-1]
+                self.invalidate_layout_from(self.focus)
+                self.set_needs_layout()
+            return
         if self.focus and self.focus.tag == "input":
             self.focus.attributes["value"] = self.focus.attributes.get("value", "")[:-1]
             self.set_needs_render()
 
     def enter(self):
+        frame = self.focused_frame or self
+        if frame is not self:
+            frame.enter()
+            return
         if not self.focus:
             return
-        if self.js and self.js.dispatch_event("click", self.focus):
+        if self.js and self.js.dispatch_event(
+            "click", self.focus, self.window_id
+        ):
             return
         if self.focus.tag == "input":
             self.focus.attributes.setdefault("value", "")
             self.set_needs_render()
+        elif "contenteditable" in self.focus.attributes:
+            self.keypress("\n")
         elif self.focus.tag == "a" and "href" in self.focus.attributes:
             self.load(
                 self.url.resolve(self.focus.attributes["href"]),
@@ -2395,9 +3124,17 @@ class Tab:
         self.focus = node
         if node:
             node.is_focused = True
+            if self.parent_frame:
+                self.root.focused_frame = self
+        elif self.parent_frame and self.root.focused_frame is self:
+            self.root.focused_frame = None
         self.set_needs_render()
 
     def advance_tab(self):
+        frame = self.focused_frame or self
+        if frame is not self:
+            frame.advance_tab()
+            return
         focusable_nodes = [
             node for node in tree_to_list(self.nodes, [])
             if isinstance(node, Element) and is_focusable(node)
@@ -2417,31 +3154,65 @@ class Tab:
                 self.browser.focus_addressbar()
 
     def zoom_by(self, increment):
-        if increment:
-            self.zoom *= 1.1
-            self.scroll *= 1.1
-        else:
-            self.zoom /= 1.1
-            self.scroll /= 1.1
-        self.scroll_changed_in_tab = True
-        self.set_needs_render()
+        frames = self.root.all_frames()
+        for frame in frames:
+            if increment:
+                frame.zoom *= 1.1
+                frame.scroll *= 1.1
+            else:
+                frame.zoom /= 1.1
+                frame.scroll /= 1.1
+            frame.scroll_changed_in_tab = True
+            frame.needs_render = True
+            frame.needs_style = True
+            frame.needs_layout = True
+            frame.needs_paint = True
+        self.root.needs_accessibility = True
+        self.root.set_needs_animation_frame(immediate=True)
 
     def reset_zoom(self):
-        self.scroll /= self.zoom
-        self.zoom = 1.0
-        self.scroll_changed_in_tab = True
-        self.set_needs_render()
+        frames = self.root.all_frames()
+        for frame in frames:
+            frame.scroll /= frame.zoom
+            frame.zoom = 1.0
+            frame.scroll_changed_in_tab = True
+            frame.needs_render = True
+            frame.needs_style = True
+            frame.needs_layout = True
+            frame.needs_paint = True
+        self.root.needs_accessibility = True
+        self.root.set_needs_animation_frame(immediate=True)
 
     def set_dark_mode(self, value):
-        self.dark_mode = value
-        self.set_needs_render()
+        frames = self.root.all_frames()
+        for frame in frames:
+            frame.dark_mode = value
+            frame.needs_render = True
+            frame.needs_style = True
+            frame.needs_layout = True
+            frame.needs_paint = True
+        self.root.needs_accessibility = True
+        self.root.set_needs_animation_frame(immediate=True)
+
+    def current_frame(self):
+        return self.focused_frame or self
 
     def render(self):
+        child_work = False
+        if self.parent_frame is None:
+            child_work = any(
+                frame is not self and (
+                    frame.needs_render or frame.needs_style or
+                    frame.needs_layout or frame.needs_paint
+                )
+                for frame in self.window_id_to_frame.values()
+            )
         if not (
             self.needs_render
             or self.needs_style
             or self.needs_layout
             or self.needs_paint
+            or child_work
         ) and self.document is not None:
             return
         if not getattr(self, "nodes", None):
@@ -2451,11 +3222,16 @@ class Tab:
             self.needs_style = False
             self.needs_layout = True
         if self.needs_layout:
-            self.document = DocumentLayout(self.nodes)
+            if self.document is None:
+                self.document = DocumentLayout(self.nodes, self)
             self.document.layout(self.zoom)
             self.needs_layout = False
             self.needs_paint = True
             self.needs_accessibility = True
+        if self.parent_frame is None:
+            for frame in self.window_id_to_frame.values():
+                if frame is not self and frame.loaded:
+                    frame.render()
         if self.needs_paint:
             self.display_list = []
             paint_tree(self.document, self.display_list)
@@ -2494,6 +3270,20 @@ class Tab:
         forward = self.forward_history.pop()
         self.history.append(forward)
         self.load(forward, add_history=False)
+
+    def post_message(
+        self, message, target_window_id, source_window_id, origin="*"
+    ):
+        target = self.root.window_id_to_frame.get(target_window_id)
+        source = self.root.window_id_to_frame.get(source_window_id)
+        if not target or not target.js or not source:
+            return
+        target.js.dispatch_post_message(
+            message,
+            source_window_id,
+            source.url.origin() if source.url else "about:",
+            target_window_id,
+        )
 
 class Browser:
     def __init__(self):
@@ -2752,16 +3542,17 @@ class Browser:
         return ran
 
     def request_animation_frame(self, tab, immediate=False):
-        tab.needs_animation_frame = True
-        if tab is not self.active_tab:
+        target = tab.root if getattr(tab, "parent_frame", None) else tab
+        target.needs_animation_frame = True
+        if target is not self.active_tab:
             return
         now = time.monotonic()
-        if tab.animation_frame_scheduled:
+        if target.animation_frame_scheduled:
             return
         if immediate:
-            tab.next_animation_frame = now
-        elif tab.next_animation_frame <= now:
-            tab.next_animation_frame = now + REFRESH_RATE_SEC
+            target.next_animation_frame = now
+        elif target.next_animation_frame <= now:
+            target.next_animation_frame = now + REFRESH_RATE_SEC
 
     def _run_animation_frame_task(self, tab):
         try:
@@ -3005,7 +3796,7 @@ def mainloop(browser):
             sdl2.SDL_Delay(delay_ms)
 
 if __name__ == "__main__":
-    sdl2.SDL_Init(sdl2.SDL_INIT_EVENTS)
+    sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO | sdl2.SDL_INIT_EVENTS)
     browser = Browser()
     if len(sys.argv) > 1:
         browser.new_tab(URL(sys.argv[1]))
